@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# 브랜드킷 — 로컬 보관, 공개 안 함
+branding/
