@@ -1,0 +1,65 @@
+name: Deploy Flutter Web to GitHub Pages
+
+# Repo: leekh8/finimondo  →  https://leekh8.github.io/finimondo/
+# base-href must be /finimondo/ so static assets resolve (otherwise 404).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # allow manual runs from the Actions tab
+
+# GITHUB_TOKEN permissions required by actions/deploy-pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two deploys at once; a newer push cancels an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable          # pubspec needs Dart >=3.12.2 → latest stable
+          cache: true              # cache the Flutter SDK between runs
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build web
+        run: flutter build web --release --base-href /finimondo/
+
+      # --- GitHub Pages SPA fallback ---------------------------------------
+      # Pages serves 404.html on any unknown path; copying index.html there
+      # lets Flutter's router handle deep links / refreshes instead of 404.
+      - name: SPA 404 fallback
+        run: cp build/web/index.html build/web/404.html
+
+      # Stop Jekyll from stripping files/dirs that start with "_".
+      - name: Disable Jekyll
+        run: touch build/web/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
