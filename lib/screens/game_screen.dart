@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 
 import '../game/game_state.dart';
@@ -13,12 +15,21 @@ class GameScreen extends StatefulWidget {
 
 class _GameScreenState extends State<GameScreen> {
   late final GameState _game;
+  final Random _rng = Random();
+
+  /// AI 한 수를 딜레이 후 실행하도록 예약해 두면 true(중복 예약 방지).
+  bool _aiPending = false;
+
+  /// 지금 "생각 중"인 AI 이름(없으면 null). 상대 아바타에 표시.
+  String? _thinkingName;
 
   @override
   void initState() {
     super.initState();
     _game = GameState();
     _game.addListener(_onGameChanged);
+    // 첫 카드가 우연히 AI 차례를 만들지는 않지만(사람이 0번), 방어적으로 한 번 확인.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeScheduleAi());
   }
 
   void _onGameChanged() {
@@ -26,7 +37,24 @@ class _GameScreenState extends State<GameScreen> {
     setState(() {});
     if (_game.awaitingColorChoice) {
       _askColor();
+      return;
     }
+    _maybeScheduleAi();
+  }
+
+  /// AI 차례면 0.8~1.5초 뒤 한 수를 두도록 예약한다. stepAi가 notify → 이 콜백을
+  /// 다시 부르므로, 사람 차례가 돌아올 때까지 딜레이를 두고 자연스레 이어진다.
+  void _maybeScheduleAi() {
+    if (_aiPending || !_game.isAiTurn) return;
+    _aiPending = true;
+    setState(() => _thinkingName = _game.currentPlayer.name);
+    final ms = 800 + _rng.nextInt(701); // 0.8s ~ 1.5s "생각 중"
+    Future.delayed(Duration(milliseconds: ms), () {
+      if (!mounted) return;
+      _aiPending = false;
+      _thinkingName = null;
+      _game.stepAi(); // → notifyListeners → _onGameChanged → 다음 수 예약
+    });
   }
 
   @override
@@ -91,6 +119,8 @@ class _GameScreenState extends State<GameScreen> {
             _buildOpponents(),
             const Spacer(),
             _buildTable(),
+            const SizedBox(height: 10),
+            _buildLastAction(),
             const Spacer(),
             _buildStatus(),
             _buildHand(human),
@@ -107,19 +137,53 @@ class _GameScreenState extends State<GameScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: ais.map((p) {
-          final isTurn = _game.currentPlayer == p;
-          return Column(
-            children: [
-              CircleAvatar(
-                backgroundColor: isTurn ? Colors.amber : Colors.white24,
-                child: Text('${p.hand.length}',
-                    style: TextStyle(
-                        color: isTurn ? Colors.black : Colors.white,
-                        fontWeight: FontWeight.bold)),
+          final isTurn = _game.currentPlayer == p && _game.winner == null;
+          final isThinking = _thinkingName == p.name;
+          return AnimatedContainer(
+            duration: const Duration(milliseconds: 250),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            decoration: BoxDecoration(
+              color: isTurn ? Colors.amber.withValues(alpha: 0.18) : Colors.transparent,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: isTurn ? Colors.amber : Colors.transparent,
+                width: 2,
               ),
-              const SizedBox(height: 4),
-              Text(p.name, style: const TextStyle(color: Colors.white70, fontSize: 12)),
-            ],
+            ),
+            child: Column(
+              children: [
+                CircleAvatar(
+                  backgroundColor: isTurn ? Colors.amber : Colors.white24,
+                  child: Text('${p.hand.length}',
+                      style: TextStyle(
+                          color: isTurn ? Colors.black : Colors.white,
+                          fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 4),
+                Text(p.name,
+                    style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                SizedBox(
+                  height: 16,
+                  child: isThinking
+                      ? const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 10,
+                              height: 10,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.amberAccent),
+                            ),
+                            SizedBox(width: 4),
+                            Text('생각 중',
+                                style: TextStyle(
+                                    color: Colors.amberAccent, fontSize: 10)),
+                          ],
+                        )
+                      : null,
+                ),
+              ],
+            ),
           );
         }).toList(),
       ),
@@ -172,6 +236,68 @@ class _GameScreenState extends State<GameScreen> {
         ),
       ],
     );
+  }
+
+  /// 방금 AI가 무엇을 했는지(낸 카드 / 뽑기 / 와일드 색) 눈에 보이게 표시.
+  /// 새 액션마다 페이드+슬라이드로 갈아끼운다. 사람 액션은 손패로 보이므로 생략.
+  Widget _buildLastAction() {
+    final a = _game.lastAction;
+    final show = a != null && !a.isHuman;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 300),
+      transitionBuilder: (child, anim) => FadeTransition(
+        opacity: anim,
+        child: SizeTransition(
+            sizeFactor: anim, axisAlignment: -1, child: child),
+      ),
+      child: !show
+          ? const SizedBox(key: ValueKey('no-action'), height: 0)
+          : Container(
+              key: ValueKey(_game.lastActionSeq),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.30),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: _lastActionChildren(a),
+              ),
+            ),
+    );
+  }
+
+  List<Widget> _lastActionChildren(TurnAction a) {
+    final children = <Widget>[
+      Text('${a.playerName} ',
+          style: const TextStyle(
+              color: Colors.white, fontWeight: FontWeight.bold)),
+    ];
+    if (a.kind == TurnActionKind.play && a.card != null) {
+      children
+        ..add(const Text('→ ', style: TextStyle(color: Colors.white70)))
+        ..add(CardView(card: a.card!, width: 30));
+      if (a.chosenColor != null) {
+        children
+          ..add(const SizedBox(width: 6))
+          ..add(Container(
+            width: 16,
+            height: 16,
+            decoration: BoxDecoration(
+              color: CardView.colorOf(a.chosenColor!),
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white70),
+            ),
+          ))
+          ..add(const Text(' 로 변경',
+              style: TextStyle(color: Colors.white70, fontSize: 12)));
+      }
+    } else {
+      children.add(Text('→ ${a.drawCount}장 뽑음',
+          style: const TextStyle(
+              color: Colors.amberAccent, fontWeight: FontWeight.bold)));
+    }
+    return children;
   }
 
   Widget _buildStatus() {

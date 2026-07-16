@@ -15,6 +15,44 @@ class Player {
   Player(this.name, {this.isHuman = false});
 }
 
+/// 방금 일어난 한 수(표시 전용 — 규칙과 무관). UI가 "누가 뭘 냈나"를 렌더한다.
+enum TurnActionKind { play, draw }
+
+class TurnAction {
+  final String playerName;
+  final bool isHuman;
+  final TurnActionKind kind;
+  final UnoCard? card; // kind == play 일 때 낸 카드
+  final int drawCount; // kind == draw 일 때 뽑은 장수
+  final CardColor? chosenColor; // 와일드로 지정한 색(있으면)
+
+  const TurnAction._({
+    required this.playerName,
+    required this.isHuman,
+    required this.kind,
+    this.card,
+    this.drawCount = 0,
+    this.chosenColor,
+  });
+
+  factory TurnAction.play(String name, bool isHuman, UnoCard card,
+          {CardColor? chosenColor}) =>
+      TurnAction._(
+        playerName: name,
+        isHuman: isHuman,
+        kind: TurnActionKind.play,
+        card: card,
+        chosenColor: chosenColor,
+      );
+
+  factory TurnAction.draw(String name, bool isHuman, int count) => TurnAction._(
+        playerName: name,
+        isHuman: isHuman,
+        kind: TurnActionKind.draw,
+        drawCount: count,
+      );
+}
+
 /// 게임 진행 엔진. UI는 이 상태를 구독만 한다(로직은 여기 + Rules에 모은다).
 class GameState extends ChangeNotifier {
   static const int initialHandSize = 7;
@@ -30,6 +68,8 @@ class GameState extends ChangeNotifier {
   String _message = '';
   Player? _winner;
   bool _awaitingColorChoice = false;
+  TurnAction? _lastAction; // 표시용: 방금 일어난 한 수
+  int _lastActionSeq = 0; // 애니메이션 트리거용 시퀀스
 
   GameState({Random? random, int aiCount = 3})
       : _random = random ?? Random() {
@@ -51,6 +91,11 @@ class GameState extends ChangeNotifier {
   Player? get winner => _winner;
   bool get awaitingColorChoice => _awaitingColorChoice;
   bool get isHumanTurn => currentPlayer.isHuman && _winner == null;
+  /// AI가 진행할 차례인가(색 선택 대기·승부 종료가 아닌, 현재 플레이어가 AI). UI가 딜레이 후 [stepAi]를 호출한다.
+  bool get isAiTurn =>
+      _winner == null && !_awaitingColorChoice && !currentPlayer.isHuman;
+  TurnAction? get lastAction => _lastAction;
+  int get lastActionSeq => _lastActionSeq;
   int get deckRemaining => _deck.remaining;
 
   bool canPlayCard(UnoCard card) =>
@@ -71,7 +116,14 @@ class GameState extends ChangeNotifier {
     _pendingDraw = 0;
     _winner = null;
     _awaitingColorChoice = false;
+    _lastAction = null;
+    _lastActionSeq = 0;
     _message = '게임 시작! 카드를 내세요.';
+  }
+
+  void _setLastAction(TurnAction action) {
+    _lastAction = action;
+    _lastActionSeq++;
   }
 
   void restart() {
@@ -101,6 +153,11 @@ class GameState extends ChangeNotifier {
     if (!_awaitingColorChoice) return;
     _currentColor = color;
     _awaitingColorChoice = false;
+    final la = _lastAction;
+    if (la != null && la.kind == TurnActionKind.play && la.card != null) {
+      _setLastAction(
+          TurnAction.play(la.playerName, la.isHuman, la.card!, chosenColor: color));
+    }
     _message = '색을 ${_colorName(color)}(으)로 바꿨습니다.';
     _afterTurn();
   }
@@ -125,6 +182,9 @@ class GameState extends ChangeNotifier {
     }
     _advance(Rules.turnStep(card, players.length));
 
+    // 표시용: 방금 낸 카드 기록(와일드 색은 아래에서 확정되면 갱신).
+    _setLastAction(TurnAction.play(player.name, player.isHuman, card));
+
     if (player.hand.isEmpty) {
       _winner = player;
       _message = '${player.name} 승리! 🎉';
@@ -139,6 +199,8 @@ class GameState extends ChangeNotifier {
         _awaitingColorChoice = true; // 사람은 직접 고른다
       } else {
         _currentColor = _aiPickColor(player);
+        _setLastAction(TurnAction.play(player.name, player.isHuman, card,
+            chosenColor: _currentColor));
         _message = '${player.name}이(가) 색을 ${_colorName(_currentColor)}(으)로 바꿨습니다.';
       }
     } else {
@@ -155,6 +217,7 @@ class GameState extends ChangeNotifier {
     _message = _pendingDraw > 0
         ? '${player.name}이(가) $count장 받았습니다.'
         : '${player.name}이(가) 카드를 뽑았습니다.';
+    _setLastAction(TurnAction.draw(player.name, player.isHuman, count));
     _pendingDraw = 0;
     _advance(1);
   }
@@ -164,27 +227,26 @@ class GameState extends ChangeNotifier {
     if (_current < 0) _current += players.length;
   }
 
-  /// 턴 종료 후 AI들이 연쇄적으로 진행한다.
+  /// 턴 종료 후 상태를 알린다. AI 진행은 UI가 [stepAi]로 딜레이를 두고 몰아준다
+  /// (순수 로직에 타이머를 섞지 않기 위해 자동 while 루프를 UI 페이싱으로 분리).
   void _afterTurn() {
     notifyListeners();
-    if (_winner != null) return;
-    _runAiTurns();
   }
 
-  void _runAiTurns() {
-    // 사람 차례가 돌아올 때까지 AI들이 순서대로 진행
-    while (_winner == null && !currentPlayer.isHuman) {
-      final ai = currentPlayer;
-      final playable = ai.hand
-          .where((c) => canPlayCard(c))
-          .toList(growable: false);
-      if (playable.isEmpty) {
-        _resolveDraw(ai);
-      } else {
-        _playCard(ai, _aiChoose(playable));
-      }
-      notifyListeners();
+  /// 현재 AI의 '한 수'만 진행한다. AI 차례가 아니면 아무것도 하지 않고 false를 반환.
+  /// UI가 매 호출 사이에 딜레이("생각 중")를 두어 사람이 볼 수 있게 만든다.
+  bool stepAi() {
+    if (!isAiTurn) return false;
+    final ai = currentPlayer;
+    final playable =
+        ai.hand.where((c) => canPlayCard(c)).toList(growable: false);
+    if (playable.isEmpty) {
+      _resolveDraw(ai);
+    } else {
+      _playCard(ai, _aiChoose(playable));
     }
+    notifyListeners();
+    return true;
   }
 
   /// AI 카드 선택: 공격 카드(드로우/스킵/리버스) 우선, 그다음 색 맞춤, 마지막에 와일드 아끼기.
